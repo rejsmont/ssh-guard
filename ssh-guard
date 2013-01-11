@@ -18,6 +18,7 @@ our $shorewall6 = '/sbin/shorewall6';
 our $db_home = '/var/lib/ssh-guard';
 our $db_file = 'ssh-guard.db';
 our $whitelist_file = '/etc/ssh-guard/whitelist';
+our $max_failures = 8;
 
 our @whitelist_names = ();
 our @whitelist_ips = ();
@@ -57,7 +58,7 @@ if ( $opt_u ) {
     my $evil_host = &get_evil_host($host);
     if ( ! $evil_host eq '' ) {
         my $failures = &update_host_record($evil_host);
-        if ( $failures > 3 ) {
+        if ( $failures > $max_failures ) {
             &block_evil_host($evil_host);
         }
     }
