@@ -18,7 +18,7 @@ our $shorewall6 = '/sbin/shorewall6';
 our $db_home = '/var/lib/ssh-guard';
 our $db_file = 'ssh-guard.db';
 our $whitelist_file = '/etc/ssh-guard/whitelist';
-our $max_failures = 8;
+our $max_failures = 5;
 
 our @whitelist_names = ();
 our @whitelist_ips = ();
@@ -191,7 +191,7 @@ sub block_evil_host {
     if ( ! &check_whitelist(\%host) ) {
         foreach ( @{$host{'IPs'}} )  {
             my $command = $_->version() == 4 ? $shorewall : $shorewall6;
-            my @args = ($command, "block", $_->ip());
+            my @args = ($command, "drop", $_->ip());
             system(@args) == 0
                 or warn "Unable to block host " . $_->ip() . " - shorewall failed\n";
         }
@@ -207,17 +207,21 @@ sub get_host {
     my ($err, @addrs) = getaddrinfo("$_[0]", "", { socktype => SOCK_RAW });
 
     my (%host);
-    my ($dnsname) = $_[0];
+    my ($hostname) = $_[0];
     my (@ips);
     my (@unique_ips);
 
-    $host{'name'} = $dnsname;
+    $host{'name'} = $hostname;
+
+    if(my $ip = new Net::IP ($hostname)) {
+        push(@ips,$hostname);
+    }
 
     if (! $err) {
         while( my $ai = shift @addrs ) {
             my @addr = getnameinfo( $ai->{addr}, NI_NUMERICHOST );
             my @name = getnameinfo( $ai->{addr} );
-            if (( defined $addr[1] )&&( defined $name[1] )&&( $name[1] eq $_[0] )) {
+            if (( defined $addr[1] )&&( defined $name[1] )&&(( $name[1] eq $_[0] )||( $addr[1] eq $_[0] ))) {
                 push(@ips,$addr[1]);
             }
         }
