@@ -12,7 +12,7 @@ use Net::IP;
 
 $ENV{"PATH"} = "/bin:/usr/bin:/sbin:/usr/sbin";
 
-if ($ENV{'PAM_TYPE'} eq "close_session") {
+if ((defined $ENV{'PAM_TYPE'})&&($ENV{'PAM_TYPE'} eq "close_session")) {
   exit 0;
 }
 
