@@ -1,0 +1,9 @@
+Name: Shorewall SSH guard
+Default: yes
+Priority: 32
+Auth-Type: Primary
+Auth:
+	optional			pam_exec.so /usr/local/sbin/ssh-guard -u
+Session-Type: Additional
+Session:
+	optional			pam_exec.so /usr/local/sbin/ssh-guard -r
