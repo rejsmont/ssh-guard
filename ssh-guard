@@ -1,0 +1,278 @@
+#!/usr/bin/perl -Tw
+
+use strict;
+use DateTime;
+use Getopt::Std;
+use DB_File;
+use BerkeleyDB;
+use Fcntl;
+use Socket;
+use Socket::GetAddrInfo qw(getaddrinfo getnameinfo NI_NUMERICHOST NI_NAMEREQD);
+use Net::IP;
+
+$ENV{"PATH"} = "/bin:/usr/bin:/sbin:/usr/sbin";
+
+# Adjust these to your needs:
+our $shorewall = '/sbin/shorewall';
+our $shorewall6 = '/sbin/shorewall6';
+our $db_home = '/var/lib/ssh-guard';
+our $db_file = 'ssh-guard.db';
+our $whitelist_file = '/etc/ssh-guard/whitelist';
+
+our @whitelist_names = ();
+our @whitelist_ips = ();
+
+our ($opt_r,$opt_s,$opt_u);
+$opt_r = $opt_s = $opt_u = 0;
+
+getopts( 'rsu' );
+
+if ( $opt_r + $opt_s + $opt_u > 1 ) {
+    die ("Only one of -r -s -u can be specified.\n");
+} elsif ( $opt_r + $opt_s + $opt_u == 0 ) {
+    $opt_u = 1;
+}
+
+my ($arg_host) = shift(@ARGV);
+my ($host) = '';
+
+if ( defined $arg_host ) {
+    ($host) = $arg_host =~ /^([\w.-]+)$/;
+}
+
+our (%ssh_guard_dbh);
+
+my $db_env = new BerkeleyDB::Env
+    -Home   => $db_home,
+    -Flags  => DB_CREATE| DB_INIT_CDB | DB_INIT_MPOOL
+    or die "Cannot open environment: $BerkeleyDB::Error\n";
+
+our $ssh_guard_db = tie %ssh_guard_dbh, "BerkeleyDB::Hash",
+    -Filename       => $db_file,
+    -Flags          => DB_CREATE,
+    -Env            => $db_env
+    or die "Cannot open database: $BerkeleyDB::Error\n";
+
+if ( $opt_u ) {
+    my $evil_host = &get_evil_host($host);
+    if ( ! $evil_host eq '' ) {
+        my $failures = &update_host_record($evil_host);
+        if ( $failures > 3 ) {
+            &block_evil_host($evil_host);
+        }
+    }
+} elsif ( $opt_r ) {
+    my $evil_host = &get_evil_host($host);
+    if ( ! $evil_host eq '' ) {
+        &reset_host_record(&get_evil_host($host));
+        &unblock_evil_host($evil_host);
+    }
+} elsif ( $opt_s ) {
+    if ( &get_evil_host($host) eq '' ) {
+        &list_host_records();
+    } else {
+        &print_host_record(&get_evil_host($host));
+    }
+} else {
+    die ("Something went wrong.\n");
+}
+
+undef $ssh_guard_db;
+untie(%ssh_guard_dbh);
+
+sub get_evil_host {
+    if ((! defined $_[0] ) || ( $_[0] eq '' )) {
+        if (( exists $ENV{'PAM_RHOST'} )&&( ! $ENV{'PAM_RHOST'} eq "" )) {
+            my ($pam_host) = $ENV{'PAM_RHOST'} =~ /^([\w.-]+)$/;
+            $pam_host;
+        } else {
+            '';
+        }
+    } else {
+        $_[0];
+    }
+}
+
+sub get_fail_user {
+    if ( defined $_[0] ) {
+        if ( exists $ssh_guard_dbh{$_[0] . '_user'} ) {
+            $ssh_guard_dbh{$_[0] . '_user'};
+        } else {
+            '';
+        }
+    } elsif (( exists $ENV{'PAM_USER'} )&&( ! $ENV{'PAM_USER'} eq ""  )) {
+        my ($pam_user) = $ENV{'PAM_USER'} =~ /^([\w.-]+)$/;
+        $pam_user;
+    } else {
+        '';
+    }
+}
+
+sub get_fail_timestamp {
+    if ( defined $_[0] ) {
+        if ( exists $ssh_guard_dbh{$_[0] . '_timestamp'} ) {
+            $ssh_guard_dbh{$_[0] . '_timestamp'};
+        } else {
+            0;
+        }
+    } else {
+        time;
+    }
+}
+
+sub get_failed_logins {
+    (( defined $_[0] )&&( ! $_[0] eq '' )) or die("No host speficied.\n");
+    if ( exists $ssh_guard_dbh{$_[0] . '_failed'} ) {
+        $ssh_guard_dbh{$_[0] . '_failed'};
+    } else {
+        0;
+    }
+}
+
+sub update_host_record {
+    (( defined $_[0] )&&( ! $_[0] eq '' )) or die("No host speficied.\n");
+    $ssh_guard_dbh{$_[0] . '_failed'} = &get_failed_logins($_[0]) + 1;
+    $ssh_guard_dbh{$_[0] . '_timestamp'} = &get_fail_timestamp();
+    $ssh_guard_dbh{$_[0] . '_user'} = &get_fail_user();
+    $ssh_guard_dbh{$_[0] . '_failed'}
+}
+
+sub reset_host_record {
+    (( defined $_[0] )&&( ! $_[0] eq '' )) or die("No host speficied.\n");
+    delete $ssh_guard_dbh{$_[0] . '_failed'};
+    delete $ssh_guard_dbh{$_[0] . '_timestamp'};
+    delete $ssh_guard_dbh{$_[0] . '_user'};
+}
+
+sub print_host_record {
+    (( defined $_[0] )&&( ! $_[0] eq '' )) or die("No host speficied.\n");
+    &read_whitelist();
+    print "Remote host:\t" . $_[0] . "\n";
+    print "Failed logins:\t" . &get_failed_logins($_[0]) . "\n";
+
+    if ( ! &get_fail_user($_[0]) eq "" ) {
+        print "Last user:\t" . &get_fail_user($_[0]) . "\n";
+    }
+
+    if ( ! &get_fail_timestamp($_[0]) == 0 ) {
+        my $time = DateTime->from_epoch(epoch => &get_fail_timestamp($_[0]));
+        print "Last time:\t" . $time->strftime('%a %w %b %Y %H:%M:%S %Z') . "\n";
+    }
+
+    my %host = &get_host($_[0]);
+    if ( &check_whitelist(\%host) ) {
+        print "Whitelist:\tThis host is whitelisted.\n";
+    }
+}
+
+sub list_host_records {
+    &read_whitelist();
+    printf("%-24s%8s    %-12s%-32s%12s\n","Host","Failures","User","Time","Whitelisted");
+    while ( my ($field, $data) = each %ssh_guard_dbh) {
+        if ( $field =~ m/^(.*)_failed$/ ) {
+            my $name = $1;
+            my $user = &get_fail_user($name);
+            my $time = DateTime->from_epoch(epoch => &get_fail_timestamp($name));
+            my %host = &get_host($name);
+            my $whitelisted = &check_whitelist(\%host) ? "yes" : "no";
+            printf("%-24s%8i    %-12s%-32s%12s\n",$name,$data,$user,$time->strftime('%a %w %b %Y %H:%M:%S %Z'),$whitelisted);
+        }
+    }
+}
+
+sub block_evil_host {
+    (( defined $_[0] )&&( ! $_[0] eq '' )) or die("No host speficied.\n");
+
+    my (%host) = &get_host($_[0]);
+
+    &read_whitelist();
+
+    if ( ! &check_whitelist(\%host) ) {
+        foreach ( @{$host{'IPs'}} )  {
+            my $command = $_->version() == 4 ? $shorewall : $shorewall6;
+            my @args = ($command, "block", $_->ip());
+            system(@args) == 0
+                or warn "Unable to block host " . $_->ip() . " - shorewall failed\n";
+        }
+    }
+}
+
+sub unblock_evil_host {
+    (( defined $_[0] )&&( ! $_[0] eq '' )) or die("No host speficied\n");
+    print "Unblocking $_[0]\n";
+}
+
+sub get_host {
+    my ($err, @addrs) = getaddrinfo("$_[0]", "", { socktype => SOCK_RAW });
+
+    my (%host);
+    my ($dnsname) = $_[0];
+    my (@ips);
+    my (@unique_ips);
+
+    $host{'name'} = $dnsname;
+
+    if (! $err) {
+        while( my $ai = shift @addrs ) {
+            my @addr = getnameinfo( $ai->{addr}, NI_NUMERICHOST );
+            my @name = getnameinfo( $ai->{addr} );
+            if (( defined $addr[1] )&&( defined $name[1] )&&( $name[1] eq $_[0] )) {
+                push(@ips,$addr[1]);
+            }
+        }
+    }
+
+    @unique_ips = do { my %seen; grep { !$seen{$_}++ } @ips };
+
+    foreach ( @unique_ips ) {
+        if(my $ip = new Net::IP ($_)) {
+            push(@{$host{'IPs'}},$ip);
+        }
+    }
+
+    %host;
+}
+
+sub read_whitelist {
+    if(open(WHITELIST, $whitelist_file)) {
+        while(<WHITELIST>) {
+            chomp($_);
+            if(my $ip = new Net::IP ($_)) {
+                push(@whitelist_ips,$ip);
+            } elsif($_ =~ /^([\w.-]+)$/) {
+                push(@whitelist_names,$_);
+            } elsif(!(($_ eq '')||($_ =~ /^\#.*$/))) {
+                warn "\"$_\" is not valid whitelist entry\n";
+            }
+        }
+    }
+    else {
+        warn "Can't open whitelist: $!\n";
+    }
+    close(WHITELIST);
+}
+
+sub check_whitelist {
+
+    my %host = %{$_[0]};
+    my $whitelisted = 0;
+
+    while ((!$whitelisted)&&(my ($i,$wname) = each(@whitelist_names))) {
+        if ($host{'name'} =~ /^.*\Q$wname\E$/) {
+            $whitelisted = 1;
+        }
+    }
+
+    while ((!$whitelisted)&&(my ($i,$wip) = each(@whitelist_ips))) {
+        while ((!$whitelisted)&&(my ($j,$hip) = each(@{$host{'IPs'}}))) {
+            if ($hip->version() == $wip->version()) {
+                my $overlap = $hip->overlaps($wip);
+                if (($overlap == $IP_IDENTICAL)||($overlap == $IP_A_IN_B_OVERLAP)) {
+                    $whitelisted = 1;
+                }
+            }
+        }
+    }
+
+    $whitelisted;
+}
