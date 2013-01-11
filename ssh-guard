@@ -12,6 +12,10 @@ use Net::IP;
 
 $ENV{"PATH"} = "/bin:/usr/bin:/sbin:/usr/sbin";
 
+if ($ENV{'PAM_TYPE'} eq "close_session") {
+  exit 0;
+}
+
 # Adjust these to your needs:
 our $shorewall = '/sbin/shorewall';
 our $shorewall6 = '/sbin/shorewall6';
